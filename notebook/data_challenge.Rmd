@@ -1,0 +1,484 @@
+
+---
+title: "ACIC Data Challenge 2022 Illustration"
+author: Yuqin Wei
+output:
+  github_document:
+    toc: true
+---
+
+The goal of this document is to illustrate:  
+1. How to get ATT for this challenge using one replicate of data. The method of choice is propensity score weighting (IPTW-ATT) + Non-linear DID.  
+2. How to (partially) create our own data generation process and how to calibrate a true ATT effect for that DGP.  
+3. How to evaluate performance for causal inference methods.  
+
+### Data Preparation  
+
+The whole analysis only look at replicate 0001. All four csv files were loaded and merged appropriately. We will need a patient level file to fit propensity score model, and a patient-year level file to fit the outcome regression. Y includes some negative outliers and truncated to 0.01. 
+
+```{run eval=FALSE, include=FALSE}
+#./setup/snowflake_credentials
+```
+
+```{r eval=FALSE, include=FALSE}
+# Install package in notebook environment
+# install.packages("lme4")
+# install.packages("cobalt")
+# install.packages("WeightIt")
+# install.packages("pbapply")
+# install.packages("statmod")
+# install.packages("lmtest")
+# install.packages("sandwich")
+# install.packages("mboost")
+```
+
+```{r include=FALSE}
+# server, db, schema and warehouse if using databricks
+sfUrl = "komodohealth.snowflakecomputing.com"
+sfDatabase = "SANDBOX_KOMODO"
+sfSchema = "YWEI"
+sfWarehouse = "LARGE_WH"
+sfRole = "ANALYST"
+```
+
+```{r include=FALSE}
+knitr::opts_chunk$set(cache=TRUE)
+library(parallel)
+library(pbapply)
+library(WeightIt)
+library(cobalt)
+library(ggplot2)
+library(sparklyr)
+library(dplyr)
+library(statmod)
+library(lmtest)
+library(sandwich)
+library(mboost)
+# sc <- spark_connect(method = "databricks")
+# SparkR::sparkR.session()
+# options(dplyr.width = Inf)
+```
+
+```{r}
+# load rep_0001 processed on snowflake, or local machine, this is a patient-year level data
+if (Sys.info()["sysname"] == "Darwin") {
+  rep_no <- "0001"
+  folder <- "../Data/track1a"
+  patient <- read.csv(file.path(folder, "patient", paste0("acic_patient_", rep_no, ".csv")))
+  patient_year <- read.csv(file.path(folder, "patient_year", paste0("acic_patient_year_", rep_no, ".csv")))
+  practice <- read.csv(file.path(folder, "practice", paste0("acic_practice_", rep_no, ".csv")))
+  practice_year <- read.csv(file.path(folder, "practice_year", paste0("acic_practice_year_", rep_no, ".csv")))
+    
+  rep_0001 <- patient_year %>%
+    left_join(patient) %>%
+    left_join(practice) %>%
+    left_join(practice_year %>% select(id.practice, year, Z, post))
+  
+  colnames(rep_0001) <- toupper(colnames(rep_0001))
+  colnames(rep_0001) <- gsub('\\.', '_', colnames(rep_0001))
+  
+} else {
+  rep_0001 <- spark_read_source(
+    sc=sc, 
+    name = "rep_0001",
+    source = "snowflake", 
+    options = list(
+      sfUrl = sfUrl,
+      sfUser = user,
+      sfPassword = password,
+      sfDatabase = sfDatabase,
+      sfSchema = sfSchema,
+      sfWarehouse = sfWarehouse,
+      sfRole = sfRole,
+      dbtable = "rep_0001"
+    )
+  )
+}
+```
+
+```{r}
+head(rep_0001)
+```
+
+```{r}
+# clean some Y outliers
+# create a patient level df, confirm that V and X are time-invariant features
+patient_year_df <- as.data.frame(rep_0001) %>% mutate(Y = pmax(Y, 0.01))
+patient_df <-
+  patient_year_df %>% 
+  select(ID_PATIENT, ID_PRACTICE, Z, V1, V2, V3, V4, V5, X1, X2, X3, X4, X5, X6, X7, X8, X9) %>%
+  distinct
+nrow(patient_df) %>% print
+nrow(patient_year_df) %>% print
+length(unique(patient_year_df$ID_PATIENT)) %>% print
+```
+
+### Propensity Score Weighting (IPTW-ATT)  
+
+I use `WeightIt` package to simplify the process of weight calculation, but essentially it fits a logistic regression `Z ~ V1 + V2 + V3 + V4 + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9` using the patient level data (without any other ML tricks such as CV, etc.), and calculated the fitted probability for each patient. Then inverse probability treatment weight can be calculated. Here we use ATT weight, it is slightly different from ATE weight. ATT weight looks like: for treatment group, everyone has a weight of constant 1. For the control group, $weight = c*p/(1-p)$ where c standardize the sum of control group weight to be similar to the original population (standardized weight). 
+
+Before running the weightit package, we can quickly run a logit model and take a look at the coefficients. We will see that V1, V2 and V3 hardly predict Z so we can consider drop, or use a model with regularization to automatically drop those terms.
+
+```{r}
+#ps_model <- lme4::glmer(Z ~ V1 + V2 + V3 + V4 + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9 + (1 | ID_PRACTICE),
+#              data = rep_0001_patient_df, family = binomial)
+ps_model <- glm(Z ~ V1 + V2 + V3 + V4 + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9,
+              data = patient_df, family = binomial)
+summary(ps_model)
+```
+
+We use `weightit` function to fit the same model and also generate ATT weights. A few diagnostics on the weights were performed: 
+1. check propensity score distribution before and after weighting. Recall $pscore = P(Z|X)$, it is a probability between 0 and 1.   
+2. check weight distribution. Since we use ATT weight, we only check the distribution for the control. (All treated sample will be assign a weight of 1)   
+3. check covariate balance before and after weighting.   
+  
+From the density plot we can see that the two curves are getting closer after weighting, while there may still be room for improvement. The distribution looks like a multi-modal distribution. This gives us the hint that the propensity score is heavily a function of practice, and that's why we see those clustering effects. This may help us improve the model selection for ps estimation. And the treated group curve didn't move at all, this makes sense since we are using ATT weight and weight == 1 for the treated group. 
+
+Not much to say about the weight distribution plot. We expect the distribution centered at 1 after standardization and it should be more or less symmetric on log scale. If extreme weights are observed, this indicates samples with poor overlaps and sometimes weight truncation is used for more robust results. (Imagine a weight = 10 is similar to ten treatment match to one control, that control sample seems over represented.)  
+
+From the covariate balance table and chart we see that covariates are much more balanced after weighting (by checking balance score, Standardized Mean Difference). Typically the rule-of-thumb is to use 0.1 as the threshold and claim a balance if SMD < 0.1. In this case, X8 is the only variable marginally failed the check. We can try some other methods to achieve a better balance on X8 but let's move on for now.  
+
+```{r}
+weightit_model <- weightit(Z ~ V1 + V2 + V3 + V4 + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9,
+              data = patient_df, method = "ps", estimand = "ATT")
+```
+
+```{r, cache = FALSE}
+plot_weightit <- function(model) {
+  require(ggplot2)
+  options(repr.plot.width=1000, repr.plot.height=300)
+  plot_df <- 
+    rbind(
+      data.frame(phase = "Unweighted", weights = 1, treat = model$treat, ps = model$ps),
+      data.frame(phase = "Weighted", weights = model$weights, treat = model$treat, ps = model$ps)
+    )
+  plot_df$phase <- as.factor(plot_df$phase)
+  plot_df$treat <- as.factor(plot_df$treat)
+  ggplot(plot_df) + geom_density(aes(x = ps, color = treat, weight = weights)) + facet_grid(~ phase) + ggtitle("Propensity Score Distribution")
+}
+plot_weightit(weightit_model)
+```
+
+```{r, cache = FALSE}
+plot_weightit_weight <- function(model) {
+  require(ggplot2)
+  options(repr.plot.width=1000, repr.plot.height=300)
+  plot_df <- 
+    data.frame(weights = model$weights, treat = model$treat) %>%
+    filter(treat == 0)
+  ggplot(plot_df) + geom_density(aes(x = weights)) + ggtitle("Standardized IPTW-ATT Weight Distribution for Control Group") + scale_x_log10()
+}
+plot_weightit_weight(weightit_model)
+```
+
+```{r}
+# Check covariate balance
+# cov_lst <- c("V1", "V2", "V3", "V4", "V5", "X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8", "X9")
+bal_tab <- bal.tab(weightit_model, un = T, disp = c("means"))
+bal_tab
+```
+
+```{r, cache = FALSE}
+love.plot(bal_tab, threshold = .1)
+```
+
+```{r}
+## Merge weights on the longitudinal data
+patient_df$weights <- weightit_model$weights
+patient_year_df <- patient_year_df %>%
+  left_join(patient_df %>% select(ID_PATIENT, weights))
+```
+
+### Outcome Model and ATT Estimation
+
+Using weighted samples, we can model the longitudinal outcomes Y using a DID model. The simplest form of DID model calculate the 'change' in the intervention arm and the 'change' in the control arm, claim that the difference in the change is the causal effect from the intervention. This can usually be achieved by fitting a linear regression (OLS) with post:intervention interaction, and the interaction term is the DID estimates. The problem here is more complicated in a few ways: 
+1. We have four years of data, so the annual trend should be adjusted and the estimand are year 3 and year 4 ATT respectively, so we need two interaction terms.    
+2. Cost data are highly skewed and usually should be modeled following a non-linear transformation. Puhani 2012 (https://ftp.iza.org/dp3478.pdf) described a method to construct ATT for non-linear DID model.  
+
+Finally, we can also run a model by adding (X, V). This is considered as a doubly-robust approach. 
+
+We can try the naive DID model with OLS, and explore some other options. The good news is, as long as we using the weights we created before, we no longer need to worry about X and V any more. 
+
+To note that, since weighted regression suffer from heteroskedasticity issue (unequal variance, violates iid assumption!), robust sandwich estimator is used to quantify CI (wider than without s.e. adjustment, while keep point estimates the same.)  
+
+```{r}
+# manually assign two interaction terms, will be useful later
+patient_year_df <- patient_year_df %>%
+  mutate(Z_YEAR3 = as.numeric(Z == 1 & YEAR == 3),
+         Z_YEAR4 = as.numeric(Z == 1 & YEAR == 4),
+         T = as.numeric(Z == 1 & POST == 1))
+
+## Naive DID model, estimate year 3 and 4 separately
+cost_model1 <- lm(Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4, data = patient_year_df, weights = weights)
+summary(cost_model1)
+```
+
+The causal effects are two interaction terms here, so 35 and 27 for YEAR3 and YEAR4.  
+
+```{r}
+## robust SE is needed for weighted model
+confint.robust <- function (object, parm, level = 0.95, ...)
+{
+    cf <- coef(object)
+    pnames <- names(cf)
+    if (missing(parm))
+        parm <- pnames
+    else if (is.numeric(parm))
+        parm <- pnames[parm]
+    a <- (1 - level)/2
+    a <- c(a, 1 - a)
+    pct <- stats:::format.perc(a, 3)
+    fac <- qnorm(a)
+    ci <- array(NA, dim = c(length(parm), 2L), dimnames = list(parm,
+        pct))
+    ses <- sqrt(diag(sandwich::vcovHC(object, type="HC1")))[parm]
+    ci[] <- cf[parm] + ses %o% fac
+    ci
+}
+# confint.default(cost_model1, level = 0.9)
+confint.robust(cost_model1, level = 0.9)
+```
+
+```{r}
+## Naive DID model, estimate year 3 and 4 together
+## The interaction term will serve like a weighted average across two years
+cost_model2 <- lm(Y ~ Z + factor(YEAR) + Z:POST, data = patient_year_df, weights = weights)
+summary(cost_model2)
+```
+
+```{r}
+# Non-linear DID model, Punahi method
+# We assume a gamma model with identity link. Need to visit the assumption later.
+cost_model3 <- glm(Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4 , data = patient_year_df, weights = weights, family = Gamma("identity"))
+#cost_model3 <- glm(Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4 , data = patient_year_df, weights = weights, family = inverse.gaussian)
+summary(cost_model3)
+```
+
+```{r}
+confint.robust(cost_model3, level = 0.9)
+```
+
+```{r}
+# ATT can be calculated by switching on/off interaction terms. We will see the result match with coefficients! This is only true for some family and some link function.
+
+patient_year_df_3 <- patient_year_df %>% filter(YEAR == 3, Z == 1)
+pred_3_1 <- patient_year_df_3 %>% predict(cost_model3, newdata = ., type = "response")
+pred_3_0 <- patient_year_df_3 %>% mutate(Z_YEAR3 = 0) %>% predict(cost_model3, newdata = ., type = "response")
+ATT3 <- mean(pred_3_1 - pred_3_0)
+
+pred_4_1 <- patient_year_df %>% filter(YEAR == 4, Z == 1) %>% predict(cost_model3, newdata = ., type = "response")
+pred_4_0 <- patient_year_df %>% filter(YEAR == 4, Z == 1) %>% mutate(Z_YEAR4 = 0) %>% predict(cost_model3, newdata = ., type = "response")
+ATT4 <- mean(pred_4_1 - pred_4_0)
+
+print(c(ATT3, ATT4))
+```
+
+```{r message=FALSE, warning=FALSE}
+# Actually the Punahi method in DID model was designed without propensity score at all. So we can run a regression model by adjusting all X and check the result.
+# There is some convergence issue so I dropped V4
+# partial solved the issue but not converge well, leave it as it is for now. 
+cost_model4 <- glm(Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4 + (V1 + V2 + V3
+                   # + V4
+                   + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9)
+                   , data = patient_year_df, weights = weights, family = Gamma("identity"))
+summary(cost_model4)
+```
+
+```{r}
+# ATT can be calculated by switching on/off interaction terms. Specifically:
+patient_year_df_3 <- patient_year_df %>% filter(YEAR == 3, Z == 1)
+pred_3_1 <- patient_year_df_3 %>% predict(cost_model4, newdata = ., type = "response")
+pred_3_0 <- patient_year_df_3 %>% mutate(Z_YEAR3 = 0) %>% predict(cost_model4, newdata = ., type = "response")
+ATT3 <- mean(pred_3_1 - pred_3_0)
+
+pred_4_1 <- patient_year_df %>% filter(YEAR == 4, Z == 1) %>% predict(cost_model4, newdata = ., type = "response")
+pred_4_0 <- patient_year_df %>% filter(YEAR == 4, Z == 1) %>% mutate(Z_YEAR4 = 0) %>% predict(cost_model4, newdata = ., type = "response")
+ATT4 <- mean(pred_4_1 - pred_4_0)
+
+print(c(ATT3, ATT4))
+```
+
+We don't know the performance of all results above. You can try your own methods see if they are similar to the numbers I got or not. To understand model performance, we will have to use our own DGP to generate data, quantify true effect, run whatever your favorate methods many times on many different realizations and summarize performance.  (This is pretty much ACIC challenge organizer's job.)
+
+#### Performance Evaluation Given True Model
+
+To demonstrate those methods actually works with the (simplest) known DGP, We can define our own DGP and simulate own data and quantify ATT. For ATT calibration, we take (X, V) from replicate 0001 for those with Z == 1, re-assign Z = 1 or 0, and simulate Y ~ exp(a + b(Z,X,V)) using coefficients from model4 which is our underlying true model. ATT can be calculated within each iteration and we average across iterations. If we do it correctly, LLN tells us we are getting ATT=E(Y1-Y0).  
+
+```{r, cache=F}
+library(pbapply)
+library(parallel)
+cl <- makeCluster(detectCores())
+```
+
+```{r true_att_sim, cache = T}
+dispersion <- summary(cost_model4)$dispersion
+patient_year_df_att <- 
+  patient_year_df %>% 
+  filter(Z == 1, YEAR %in% c(3, 4)) %>% 
+  mutate(mu1 = predict(cost_model4, newdata = ., type = "response")) %>%
+  mutate(mu0 = predict(cost_model4, newdata = mutate(., Z = 0, Z_YEAR3 = 0, Z_YEAR4 = 0), type = "response"))
+
+clusterExport(cl = cl, c('patient_year_df_att', 'dispersion'))
+clusterSetRNGStream(cl, iseed = 4321)
+res_att <- pblapply(1:1000, function(i) {
+  require(dplyr)
+  require(statmod)
+  patient_year_df_att %>%
+  mutate(Y1 = rgamma(n(), dispersion, scale=mu1/dispersion)) %>%
+  mutate(Y0 = rgamma(n(), dispersion, scale=mu0/dispersion)) %>%
+  #mutate(Y1 = rinvgauss(n(), mean = mu1, dispersion=dispersion)) %>%
+  #mutate(Y0 = rinvgauss(n(), mean = mu0, dispersion=dispersion)) %>%
+  group_by(YEAR) %>%
+  summarize(ATT = mean(Y1 - Y0))
+  }, cl = cl
+)
+```
+
+```{r true_att_res, cache = T}
+summ_att <- res_att %>% do.call(rbind, .) %>%
+group_by(YEAR) %>%
+summarize(ATT_TRUTH = mean(ATT), lb = quantile(ATT, 0.025), ub = quantile(ATT, 0.975))
+summ_att
+```
+
+Here I did only 1000 iterations. The range here is just to give me an idea how well I'm quantifying the true ATT under this DGP, and we are supposed to run it as many time until we are happy about the accuracy. Assume the true ATT is 51.3 and 48.2, this is not too different from 49.6, 46.5 we got from model 4 by fitting the challenge data 0001. To note that this is not a fair comparison, since replicate 0001 is not using our DGP.
+
+I created 100 more realizations for the full set of data (not just the treated in year3 and year4), apply the same estimation methods from the beginning to the end and evaluate the performance.  
+
+Four models have been tested here:  
+1. DID: weighted DID using OLS.  
+2. GLM: weighted DID using GLM (Gamma family, identity link).  
+3. DR: method 2 + adjusting for X and V, doubly robust.  
+4. UN: unweighted DID adjusting for X and V.  
+
+Four performance metrics:  
+1. bias  
+2. rmse  
+3. coverage  
+4. with of CI  
+
+```{r}
+# build a small pipeline to sim data and fit the model
+# I've been lazy here by re-using a lot of global vars
+# we don't need to subset here since we simulate the Y for the whole (X, V, Z)
+# we don't need to simulate counterfactual outcome
+# we do overwrite the Y
+# I'm not simulating Z here, this is cheating, but I'm doing it anyway so I reuse the exact same propensity score model. This could also cost me with biased result since PS model maybe mis-specified.
+
+sim_data <- function() {
+  sim_df <- 
+    patient_year_df %>% 
+    mutate(mu = predict(cost_model4, newdata = ., type = "response")) %>%
+    mutate(Y = rgamma(n(), dispersion, scale=mu/dispersion))
+  sim_df
+}
+
+fit_model <- function(sim_df) {
+  require(WeightIt)
+  require(dplyr)
+  sim_df <- sim_df %>%
+    mutate(Z_YEAR3 = as.numeric(Z == 1 & YEAR == 3),
+           Z_YEAR4 = as.numeric(Z == 1 & YEAR == 4))
+    cost_model0 <- lm(
+        Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4, 
+        data = sim_df)
+    cost_model1 <- lm(
+        Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4, 
+        data = sim_df, weights = weights)
+    cost_model3 <- glm(
+        Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4, 
+        data = sim_df, weights = weights,
+        family = Gamma("identity"))
+    cost_model4_new <- glm(
+        Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4 +
+          V1 + V2 + V3 + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9, 
+        data = sim_df, weights = weights,
+        family = Gamma("identity"),
+        start = coef(cost_model4))
+    cost_model5 <- glm(
+        Y ~ Z + factor(YEAR) + Z_YEAR3 + Z_YEAR4 +
+          V1 + V2 + V3 + V5 + X1 + X2 + X3 + X4 + X5 + X6 + X7 + X8 + X9, 
+        data = sim_df,
+        family = Gamma("identity"),
+        start = coef(cost_model4))
+        
+    get_ATT_from_DID <- function(data, model) {
+      # not used
+      data3 <- data %>% filter(YEAR == 3, Z == 1)
+      pred_3_1 <- data3 %>% predict(model, newdata = ., type = "response")
+      pred_3_0 <- data3 %>% mutate(Z_YEAR3 = 0) %>% predict(model, newdata = ., type = "response")
+      ATT3 <- mean(pred_3_1 - pred_3_0)
+      data4 <- data %>% filter(YEAR == 4, Z == 1)
+      pred_4_1 <- data4 %>% predict(model, newdata = ., type = "response")
+      pred_4_0 <- data4 %>% mutate(Z_YEAR4 = 0) %>% predict(model, newdata = ., type = "response")
+      ATT4 <- mean(pred_4_1 - pred_4_0)
+      return(c(ATT3, ATT4))
+    }
+  
+  conf_M0 <- confint.default(cost_model0, level = 0.9)[c('Z_YEAR3', 'Z_YEAR4'),]
+  conf_DID <- confint.robust(cost_model1, level = 0.9)[c('Z_YEAR3', 'Z_YEAR4'),]
+  conf_GLM <- confint.robust(cost_model3, level = 0.9)[c('Z_YEAR3', 'Z_YEAR4'),]
+  conf_DR <- confint.robust(cost_model4_new, level = 0.9)[c('Z_YEAR3', 'Z_YEAR4'),]
+  conf_UN <- confint.default(cost_model5, level = 0.9)[c('Z_YEAR3', 'Z_YEAR4'),]
+  
+  # put those together
+  data.frame(
+    YEAR = rep(c(3, 4), 5),
+    model = rep(c("M0", "DID", "GLM", "DR", "UN"), each = 2),
+    EST = c(
+      coef(cost_model0)[c('Z_YEAR3', 'Z_YEAR4')],
+      coef(cost_model1)[c('Z_YEAR3', 'Z_YEAR4')],
+      coef(cost_model3)[c('Z_YEAR3', 'Z_YEAR4')],
+      coef(cost_model4_new)[c('Z_YEAR3', 'Z_YEAR4')],
+      coef(cost_model5)[c('Z_YEAR3', 'Z_YEAR4')]
+    ),
+    LB = c(
+      conf_M0[,1],
+      conf_DID[,1],
+      conf_GLM[,1],
+      conf_DR[,1],
+      conf_UN[,1]
+    ),
+    UB = c(
+      conf_M0[,2],
+      conf_DID[,2],
+      conf_GLM[,2],
+      conf_DR[,2],
+      conf_UN[,2]
+    )
+  )
+}
+
+system.time(test <- fit_model(sim_data()))
+# illustrate one run, took 45s on macbook
+test
+```
+
+```{r estimate_sim, cache=TRUE}
+clusterExport(cl = cl, c('patient_year_df', 'dispersion', 'sim_data', 'fit_model', 'cost_model4', 'confint.robust'))
+clusterSetRNGStream(cl, iseed = 1234)
+res <- pblapply(1:100, function(i) {
+  fit_model(sim_data())
+  }, cl = cl
+)
+```
+
+```{r estimate_res, cache=TRUE}
+# summarize result
+res %>% do.call(rbind, .) %>%
+  left_join(summ_att) %>%
+  group_by(YEAR, model) %>%
+  summarize(estimate = mean(EST),
+            truth = mean(ATT_TRUTH),
+            bias = mean(EST - ATT_TRUTH),
+            rmse = sqrt(mean((EST - ATT_TRUTH)^2)),
+            coverage = mean(as.numeric(LB < ATT_TRUTH & ATT_TRUTH < UB)),
+            width = mean(UB - LB))
+  
+```
+
+We can see all models are slightly biased, but if you think about relative error it is not too bad. Comparing among those methods, the conclusion could be mixed, that we didn't identify single method works the best. The robust standard error methods returns very nice coverage for us in a lot cases (the best result should be 90% precisely, not any more). The unweighted model is supposed to perfectly fit our data. Now I don't know why it is still slightly biased, it does yield the smallest RMSE. 
+
+The first two models shows the power for propensity score model. Recall in the regression phase we are not touching (X, V) by any means, so all confounder information are passed through the weights. However, this could also be the source of the bias, because we are not sure if the propensity score model is correctly specified by that logistic regression, and we may not be adjusting the confounders by the correct magnitude.  
+
+If we replace the DGP to be a complex process, I'm expecting the model I build not going to perform well. That's one of the goal for this challenge, see what automated pipeline can be the most robust that fits in problems of different types. (ML can be extremely helpful since fewer distribution assumption was made on data, especially Y|X.)
